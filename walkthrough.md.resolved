@@ -1,0 +1,354 @@
+# Raven AI Route Optimizer — Complete Project Analysis
+
+## 📌 Project Summary
+
+**Raven Route Optimizer** is a full-stack web application that optimizes logistics routes in real-time by combining a **Python/Flask backend** with a **React.js frontend**. It uses a custom **heuristic-based A\* algorithm** that balances four real-time environmental factors — **traffic, weather, air quality, and elevation** — to find the safest and most efficient delivery paths.
+
+---
+
+## 🏗️ High-Level Architecture
+
+```mermaid
+graph TD
+    subgraph Frontend ["Frontend (React.js + Leaflet)"]
+        UI["App.js — UI & Map"]
+    end
+
+    subgraph Backend ["Backend (Python / Flask)"]
+        APP["app.py — Flask Server & Threading"]
+        GRAPH["graph.py — RouteGraph (A* + Dynamic Optimization)"]
+        HEUR["heuristic.py — Heuristic Scoring"]
+        PEN["models/penalties.py — Penalty Calculations"]
+    end
+
+    subgraph APIs ["External APIs"]
+        GMAP["Google Maps Directions API"]
+        GAQI["Google Air Quality API"]
+        GELEV["Google Elevation API"]
+        WAPI["WeatherAPI.com"]
+    end
+
+    UI -->|"POST /optimize"| APP
+    UI -->|"GET /status (polling)"| APP
+    UI -->|"POST /marker-close"| APP
+    APP --> GRAPH
+    GRAPH --> HEUR
+    GRAPH --> PEN
+    GRAPH --> GMAP
+    GRAPH --> GAQI
+    GRAPH --> GELEV
+    GRAPH --> WAPI
+```
+
+---
+
+## 📁 File-by-File Breakdown
+
+### Backend — `route_optimizer/`
+
+---
+
+#### [app.py](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/app.py)
+
+**Role:** Flask web server — the REST API layer and orchestrator.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/` | GET | Serves the static home page and resets state |
+| `/optimize` | POST | Accepts `source`, `destination`, `preferences`; kicks off optimization in a **background thread** |
+| `/status` | GET | Returns current `route_data` (polled by frontend every 500ms) |
+| `/marker-close` | POST | Signal from frontend that the animated marker reached a waypoint — unblocks the backend thread |
+| `/reset` | GET | Resets all server state (stops threads, clears route data) |
+
+**Key Design Patterns:**
+- **[RouteState](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/app.py#12-42) class** — Thread-safe state management using `threading.Lock`. Holds the [RouteGraph](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#15-288) instance, the active optimization thread, and the shared `route_data` dict.
+- **Background threading** — Route optimization runs in a separate thread ([run_optimization](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/app.py#108-126)), so the HTTP server stays responsive during computation.
+- **Event-based synchronization** — `marker_close_event` (a `threading.Event`) bridges the frontend animation with backend computation. The backend **waits** until the frontend confirms the marker reached the next node before computing the next segment.
+
+---
+
+#### [graph.py](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py) — ⭐ Core Algorithm
+
+**Role:** The brain of the system — route generation, graph construction, A\* optimization, and dynamic rerouting.
+
+**Class: [RouteGraph](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#15-288)** — initializes all 4 API clients + the Heuristic engine.
+
+| Method | Purpose |
+|---|---|
+| [haversine_distance(coord1, coord2)](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#27-58) | Calculates great-circle distance between two lat/lng points (used to filter nodes too close together, threshold: 250m) |
+| [generate_all_routes(source, dest)](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#162-191) | Calls Google Maps Directions API with `alternatives=True` to get all possible routes. Extracts each step's end location as a graph node. Filters nodes closer than 250m to avoid clutter |
+| [calculate_heuristic_values(route, prefs)](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#192-221) | For each segment (edge) of a route: fetches traffic, weather, elevation, and AQI data **in parallel** (ThreadPoolExecutor, 10 workers). Computes penalties and the weighted heuristic score |
+| [construct_graph(route, heuristics)](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#242-248) | Builds a directed weighted graph (adjacency dict) from route nodes + heuristic scores as edge weights |
+| [merge_graphs(graphs)](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#249-259) | Merges multiple route graphs into one, keeping the **minimum weight** for duplicate edges — this creates the "super-graph" for A\* |
+| [apply_a_star(graph, start, goal)](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#260-284) | Classic A\* pathfinding on the merged graph. Uses [heuristic_estimate()](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/heuristic.py#36-43) as the h-function. Returns the optimal path |
+| [find_optimal_route(source, dest, prefs)](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#59-83) | End-to-end pipeline: generate routes → calculate heuristics → build graphs → merge → A\* → return optimal coords |
+| [dynamic_route_optimization(...)](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#84-161) | **The main loop**: walks the optimal route node-by-node. At each node, re-fetches alternative routes, recalculates if better paths exist, and **dynamically reroutes**. Synchronizes with the frontend via `marker_close_event` |
+
+**Data Flow within [dynamic_route_optimization](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/graph.py#84-161):**
+```mermaid
+flowchart TD
+    A["Start: source → destination"] --> B["find_optimal_route()"]
+    B --> C["Walk route node by node"]
+    C --> D["Append next node to final_route"]
+    D --> E["Wait for frontend marker to reach node"]
+    E --> F["generate_all_routes from current node to destination"]
+    F --> G{">1 alternative?"}
+    G -->|Yes| H["Recalculate: heuristics → graph → A* → new optimal route"]
+    G -->|No| I["Continue on current route"]
+    H --> J["Update current_route with new optimal path"]
+    I --> K{"Reached destination?"}
+    J --> K
+    K -->|No| C
+    K -->|Yes| L["Mark status = completed"]
+```
+
+---
+
+#### [heuristic.py](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/heuristic.py)
+
+**Role:** Computes the multi-factor heuristic score for each route segment.
+
+**Scoring Formula:**
+```
+Score = Wt × T  +  We × E  +  Wa × A  +  Σ(Wi × Pi)
+```
+
+| Symbol | Meaning | Calculation |
+|---|---|---|
+| `T` | Travel time | `distance / speed` |
+| `E` | Emissions | `distance × emission_factor / fuel_efficiency` |
+| `A` | Air quality index (normalized) | `AQI / 500` |
+| `Pi` | Penalties (traffic, weather, terrain, wind) | From [Penalties](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/models/penalties.py#4-36) class |
+| `Wt, We, Wa` | Dynamic weights | Derived from user preferences (sliders) |
+| `Wi` | Penalty weights | Fixed at 0.025 each |
+
+- **[heuristic_estimate(distance_remaining)](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/heuristic.py#36-43)** — Admissible A\* heuristic: assumes best-case speed (100 km/h), minimal emissions, and zero AQI.
+- Supports multiple **vehicle types**: petrol, diesel, hybrid, electric, truck, bus — each with different CO₂ emission factors.
+
+---
+
+#### [models/penalties.py](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/models/penalties.py)
+
+**Role:** Calculates four penalty values that penalize unfavorable conditions.
+
+| Penalty | Formula / Logic |
+|---|---|
+| `Pt` (Traffic) | [(actual_duration - free_flow_duration) / free_flow_duration](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/frontend/src/App.js#7-480) — congestion ratio |
+| `Pw` (Weather) | Lookup map: Clear=0, Light rain=0.2, Heavy rain=0.5, Snow=0.7, Fog=0.5 |
+| `Pter` (Terrain) | `elevation_change / distance` — steepness ratio |
+| `Pwind` (Wind) | `wind_speed / 20` — normalized to max 20 m/s |
+
+---
+
+### API Clients — `route_optimizer/api_clients/`
+
+All clients load API keys from `.env` via `python-dotenv`.
+
+---
+
+#### [google_maps.py](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/api_clients/google_maps.py)
+
+| Method | API Called | Returns |
+|---|---|---|
+| `get_directions(origin, dest, alternatives)` | Google Maps Directions | List of route objects with step-by-step navigation |
+| `get_traffic_data(origin, dest)` | Google Maps Directions (with `departure_time=now`) | `{distance (km), duration (hours), speed (km/h)}` — uses `duration_in_traffic` for real-time accuracy |
+| `geocode(address)` | Google Maps Geocoding | `[(lat, lng)]` coordinates for a place name |
+
+---
+
+#### [google_airquality.py](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/api_clients/google_airquality.py)
+
+| Method | API Called | Returns |
+|---|---|---|
+| `get_aqi(lat, lon)` | Google Air Quality `currentConditions:lookup` | AQI float value (0-500 scale) |
+
+---
+
+#### [google_elevation.py](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/api_clients/google_elevation.py)
+
+| Method | API Called | Returns |
+|---|---|---|
+| `get_elevation(start, end)` | Google Maps Elevation | `{elevation_change: abs(end_elev - start_elev)}` in meters |
+
+Includes proper logging and error handling for network/JSON failures.
+
+---
+
+#### [weatherapi.py](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/route_optimizer/api_clients/weatherapi.py)
+
+| Method | API Called | Returns |
+|---|---|---|
+| `get_weather(lat, lon)` | WeatherAPI.com `current.json` | `{weather: [{main: condition}], wind: {speed: m/s}}` — mimics OpenWeatherMap format for compatibility with `penalties.py` |
+
+---
+
+### Frontend — `frontend/`
+
+---
+
+#### [App.js](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/frontend/src/App.js)
+
+**Role:** Single-page React application — the entire UI and map logic.
+
+**Key State Variables:**
+
+| State | Purpose |
+|---|---|
+| `source`, `destination` | User-entered locations (default: Kuragallu → Mangalagiri) |
+| `preferences` | 4 slider values (traffic, weather, elevation, air_quality) 0-100 |
+| `routeData` | Mirror of backend's `route_data` (status, final_route, alternative_routes) |
+| `status` | Current optimization status (idle, running, completed, error) |
+| `isAnimating` | Prevents overlapping animations |
+| `currentNodeIndex` | Tracks which node the marker has reached |
+| `notification` | Toast messages ("Calculating the best route", "New optimal route found") |
+
+**Core Flow:**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant React as App.js
+    participant Flask as Backend (Flask)
+
+    User->>React: Enter source, destination, preferences
+    User->>React: Click "Start Routing"
+    React->>Flask: POST /optimize {source, dest, prefs}
+    Flask-->>React: {status: "started"}
+    React->>React: Initialize Leaflet map + taxi marker
+
+    loop Every 500ms
+        React->>Flask: GET /status
+        Flask-->>React: route_data {status, final_route, alt_routes}
+        React->>React: Detect new node in final_route
+        React->>React: Draw route segment (Leaflet Routing Machine)
+        React->>React: Animate marker along route coordinates
+        React->>React: Show notification toast
+        React->>Flask: POST /marker-close {node}
+        Note right of Flask: Backend unblocks, computes next segment
+    end
+
+    Flask-->>React: {status: "completed"}
+    React->>React: showFinalRoute() — draw full route in red
+```
+
+**Key Functions:**
+
+| Function | What it does |
+|---|---|
+| `handleSubmit()` | Resets state, initializes map at source coords, calls `startOptimization()` |
+| `startOptimization()` | `POST /optimize` with source, destination, preferences |
+| `pollStatus()` (in useEffect) | Polls `GET /status` every 500ms. Detects new nodes → triggers `updateRoute()` |
+| `updateRoute()` | Draws green route segment with `L.Routing.control`. Draws alternative routes in various colors. Calls `animateMarker()` |
+| `animateMarker()` | Moves the taxi icon smoothly along route coordinates (100ms per step). When marker is within proximity threshold (10m), sends `POST /marker-close` to unblock backend |
+| `showFinalRoute()` | Draws the complete final route in **red** with all alternatives after optimization completes |
+| `resetApp()` | Cleans up map, marker, route controls, and all state |
+
+**Map Features:**
+- **Leaflet** map with OpenStreetMap tiles
+- **Custom taxi icon** (`nav[1].png`) as animated marker
+- **Leaflet Routing Machine** for drawing actual road-following routes (not straight lines)
+- **Alternative routes** drawn in 8 distinct colors (magenta, teal, orange, purple, etc.)
+- **Toast notifications** for "Calculating the best route" and "New optimal route found"
+
+---
+
+#### [styles.css](file:///f:/college%20files/projects/Raven-AI-Route-Optimizer-main/frontend/src/styles.css)
+
+Purple-themed (`#7216ff`) sidebar + full-screen map layout. Custom-styled range sliders, notification toasts, and map placeholder.
+
+---
+
+## 🔗 Integration & Data Flow Summary
+
+```mermaid
+flowchart LR
+    subgraph User
+        FORM["Source + Dest + Preferences"]
+    end
+
+    subgraph Frontend
+        REACT["React App"]
+        MAP["Leaflet Map"]
+    end
+
+    subgraph Backend
+        FLASK["Flask Server"]
+        THREAD["Background Thread"]
+        RGRAPH["RouteGraph"]
+    end
+
+    subgraph External
+        GM["Google Maps"]
+        AQ["Air Quality API"]
+        EL["Elevation API"]
+        WA["WeatherAPI"]
+    end
+
+    FORM -->|POST /optimize| FLASK
+    FLASK -->|spawns| THREAD
+    THREAD --> RGRAPH
+    RGRAPH --> GM
+    RGRAPH --> AQ
+    RGRAPH --> EL
+    RGRAPH --> WA
+    RGRAPH -->|updates route_data dict| FLASK
+    FLASK -->|GET /status response| REACT
+    REACT --> MAP
+    MAP -->|POST /marker-close| FLASK
+    FLASK -->|Event.set()| THREAD
+```
+
+**The critical synchronization mechanism:**
+1. Backend computes next waypoint → updates `route_data["final_route"]` → **blocks** on `marker_close_event.wait()`
+2. Frontend polls `/status` → detects new node → animates marker → when marker reaches node → sends `POST /marker-close`
+3. Backend receives signal → `marker_close_event.set()` → unblocks thread → computes next segment
+4. This creates a **synchronized lock-step** between backend computation and frontend visualization
+
+---
+
+## 🔑 Configuration
+
+| File | Keys |
+|---|---|
+| `.env` | `GOOGLE_API_KEY` (Maps, Elevation, Air Quality), `WEATHER_API_KEY` (WeatherAPI.com) |
+| `package.json` | React 18, Leaflet 1.9, leaflet-routing-machine 3.2, Axios |
+| `requirements.txt` | Flask (actually lists FastAPI — mismatch), requests, python-dotenv, networkx, redis, pydantic, aiohttp |
+
+> [!WARNING]
+> `requirements.txt` lists **FastAPI/uvicorn** but the actual server uses **Flask/flask-cors**. The Flask dependency is not listed in `requirements.txt`.
+
+---
+
+## 🧮 A\* Algorithm Details
+
+The A\* implementation in `apply_a_star()`:
+- **g(n)** = accumulated heuristic cost from start to node `n`
+- **h(n)** = `heuristic_estimate(distance_remaining)` — admissible lower bound assuming best-case speed & emissions
+- **f(n)** = g(n) + h(n)
+- Uses a **min-heap** priority queue via Python's `heapq`
+- The graph is a **merged super-graph** from all Google Maps alternative routes, keeping minimum edge weights
+
+---
+
+## 🔄 Dynamic Rerouting Logic
+
+At each waypoint during the journey:
+1. Fetch all alternative routes from current position to destination
+2. If multiple alternatives exist → recalculate heuristics with **fresh real-time data** → rebuild graph → run A\* again
+3. Replace remaining route with new optimal path
+4. This ensures the route adapts to **changing traffic, weather, AQI, and elevation conditions** in real-time
+
+---
+
+## 📦 Tech Stack Summary
+
+| Layer | Technology |
+|---|---|
+| **Backend Server** | Python 3, Flask, flask-cors |
+| **Route Algorithm** | Custom A\* with multi-factor heuristic |
+| **API Data** | Google Maps, Google Air Quality, Google Elevation, WeatherAPI.com |
+| **Concurrent Fetching** | `concurrent.futures.ThreadPoolExecutor` (10 workers) |
+| **Frontend Framework** | React.js 18 (Create React App) |
+| **Map Library** | Leaflet + Leaflet Routing Machine |
+| **HTTP Client** | Axios (frontend), Requests (backend) |
+| **State Sync** | REST polling (500ms) + threading.Event |
